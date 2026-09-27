@@ -1,244 +1,231 @@
-Absolutely. Here is a **copy-paste-ready, portfolio-quality `README.md`** for your deployed **datta.ai** project.
+datta.ai
 
-````markdown
-# datta.ai — AI Research Agent
+AI-powered research agent that searches the web, evaluates evidence, and turns a research question into a structured report.
 
-<p align="center">
-  <strong>Evidence-based AI-powered research assistant with web search, source credibility analysis, and structured research reports.</strong>
-</p>
 
-<p align="center">
-  <a href="https://datta-ai-gkp48r6cwrmrkft7rfgxk7.streamlit.app/">
-    <strong>🚀 Live Demo</strong>
-  </a>
-</p>
 
----
 
-## 📌 Overview
 
-**datta.ai** is an AI-powered research agent designed to transform a research question into a structured, evidence-based report.
 
-Instead of simply generating an answer from an LLM's internal knowledge, datta.ai performs web research, evaluates available sources, organizes evidence, and produces a structured research report with citations.
+🚀 Live Application
 
-The application combines:
+Open datta.ai →
 
-- 🤖 Large Language Models
-- 🔎 Real-time web search
-- 📚 Evidence collection
-- 🧠 LangGraph-based research workflow
-- 📊 Source credibility analysis
-- 📝 Structured report generation
-- 🔐 User authentication
-- 💾 Research history
-- ☁️ Streamlit Cloud deployment
+Ask a research question, let the agent gather web evidence, and receive a structured report with sources.
 
----
+🧠 What is datta.ai?
 
-## 🚀 Live Demo
+datta.ai is a research-focused AI agent built to go beyond a conventional chatbot.
 
-**Try datta.ai:**
+A normal LLM response can rely heavily on information already present in the model. datta.ai instead follows a research workflow:
 
-https://datta-ai-gkp48r6cwrmrkft7rfgxk7.streamlit.app/
+Question → Search → Evidence → Source Evaluation → Synthesis → Report
 
----
+The application combines an LLM with web search and a LangGraph workflow to investigate questions and organize the resulting evidence into a readable research report.
 
-## ✨ Key Features
+✨ Core Capabilities
 
-### 🔎 AI-Powered Web Research
+Capability
 
-Enter a research question and datta.ai searches the web for relevant information before generating the final answer.
+What it does
 
-Example:
+🔎 Web Research
 
-> How has generative AI changed software developer productivity from 2023 to 2026?
+Searches the web for information relevant to the research question
 
-The system searches for relevant sources and uses the collected evidence during report generation.
+🧠 Agentic Workflow
 
----
+Uses LangGraph to coordinate the research process
 
-### 🧠 Agentic Research Workflow
+📚 Evidence Collection
 
-The research process is implemented using **LangGraph**.
+Collects and structures information from multiple sources
 
-The workflow coordinates multiple stages including:
+🛡️ Source Evaluation
 
-```text
-Research Question
-       ↓
-Research Planning
-       ↓
-Web Search
-       ↓
-Source Collection
-       ↓
-Source Evaluation
-       ↓
-Evidence Analysis
-       ↓
-Claim Verification
-       ↓
-Report Synthesis
-       ↓
-Final Research Report
-````
+Uses source metadata and credibility signals during research
 
-This makes the application more structured than a simple single-prompt chatbot.
+🔗 Claim–Source Matching
 
----
+Connects research claims with supporting evidence
 
-### 📚 Source Credibility Analysis
+📝 Report Synthesis
 
-datta.ai does more than collect search results.
+Produces a structured final research report
 
-Sources are evaluated using signals such as:
+👤 Authentication
 
-* Domain type
-* Source category
-* Primary vs secondary source
-* Domain reputation
-* Recency
-* Query relevance
-* Source specificity
-* Evidence quality
-* Source diversity
+Supports account creation, sign-in, and guest access
 
-The system uses these signals to prioritize stronger sources during research.
+💾 Research History
 
----
+Allows users to save and revisit previous research
 
-### 📝 Structured Research Reports
+🧹 History Management
 
-The final response is organized into sections such as:
+Supports deleting individual or all saved research
 
-* Executive Summary
-* Key Findings
-* Benefits / Positive Effects
-* Limitations / Risks
-* Evidence
-* Sources
+☁️ Cloud Deployment
 
-This makes the generated research easier to read and use for academic, technical, and professional research.
+Deployed on Streamlit Community Cloud
 
----
+🔐 Secret Management
 
-### 🔗 Citations and Sources
+Keeps API credentials outside the Git repository
 
-Research results include source information so users can inspect the evidence behind the generated report.
+🏗️ How It Works
 
-The application attempts to connect claims with supporting sources rather than presenting unsupported statements as facts.
+                         ┌─────────────────────┐
+                         │    User Question    │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │   Research Agent    │
+                         │     LangGraph       │
+                         └──────────┬──────────┘
+                                    │
+                     ┌──────────────┼──────────────┐
+                     │              │              │
+                     ▼              ▼              ▼
+               ┌──────────┐  ┌────────────┐  ┌─────────────┐
+               │   Groq   │  │ Web Search │  │   Evidence  │
+               │   LLM    │  │   (DDGS)   │  │  Evaluation │
+               └────┬─────┘  └─────┬──────┘  └──────┬──────┘
+                    │              │                │
+                    └──────────────┼────────────────┘
+                                   ▼
+                         ┌─────────────────────┐
+                         │  Evidence Synthesis │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │ Structured Research│
+                         │       Report       │
+                         └─────────────────────┘
 
----
+🔬 Research Pipeline
 
-### 👤 User Authentication
+The research workflow is designed around multiple stages rather than a single LLM prompt.
 
-datta.ai includes a local authentication system with:
+1. Research Question
 
-* Account creation
-* Sign in
-* Password hashing
-* Guest access
-* Session management
-* User-specific research history
+The user enters a question through the Streamlit interface.
 
-Passwords are not stored as plaintext.
+2. Research Planning
 
-Password hashing uses:
+The agent determines how the question should be investigated.
 
-```text
-PBKDF2-HMAC-SHA256
-120,000 iterations
-```
+3. Web Search
 
----
+The search layer retrieves relevant web sources.
 
-### 💾 Research History
+4. Source Analysis
 
-Authenticated users can save and revisit previous research.
+Retrieved sources are processed using signals including:
 
-The application supports:
+Domain/source type
 
-* Viewing previous research
-* Opening saved research
-* Deleting individual research
-* Deleting all saved research
-* User-specific history
+Primary vs. secondary source
 
----
+Domain reputation heuristics
 
-### 🛡️ Error Handling and Logging
+Recency
 
-The backend includes centralized application error handling and logging.
+Query relevance
 
-The project defines application-specific exceptions for:
+Specificity
 
-```text
-DattaAIError
-├── ConfigurationError
-├── LLMError
-├── SearchError
-└── ResearchError
-```
+Source diversity
 
-Logging includes:
+5. Evidence Analysis
 
-* LLM request lifecycle
-* Web search lifecycle
-* Research workflow events
-* Application errors
+The workflow evaluates the collected information and connects claims with relevant supporting sources.
 
-Sensitive API-key patterns are redacted from logs.
+6. Report Generation
 
----
+The LLM synthesizes the researched evidence into a structured response.
 
-## 🏗️ Architecture
+📄 Report Format
 
-```text
-                         ┌──────────────────┐
-                         │      User        │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                         ┌──────────────────┐
-                         │   Streamlit UI   │
-                         │     app.py       │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                         ┌──────────────────┐
-                         │    LangGraph     │
-                         │ Research Agent   │
-                         └────────┬─────────┘
-                                  │
-                  ┌───────────────┼────────────────┐
-                  │               │                │
-                  ▼               ▼                ▼
-          ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-          │    Groq      │ │  Web Search  │ │   Evidence   │
-          │     LLM      │ │    DDGS      │ │   Analysis   │
-          └──────────────┘ └──────────────┘ └──────────────┘
-                  │               │                │
-                  └───────────────┼────────────────┘
-                                  ▼
-                         ┌──────────────────┐
-                         │ Report Synthesis │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                         ┌──────────────────┐
-                         │ Research Report  │
-                         │ + Sources        │
-                         └──────────────────┘
-```
+A typical research report contains sections such as:
 
----
+Executive Summary
+Key Findings
+Benefits / Positive Effects
+Limitations / Risks
+Evidence
+Sources
 
-## 🧩 Project Structure
+The output is designed to be useful for:
 
-```text
+Technical research
+
+Academic exploration
+
+Industry research
+
+Current-topic investigation
+
+Interview preparation
+
+Project research
+
+🛠️ Technology Stack
+
+Application
+
+Python 3.12
+
+Streamlit
+
+LangChain
+
+LangGraph
+
+AI
+
+Groq
+
+openai/gpt-oss-120b
+
+Search
+
+DDGS
+
+Storage
+
+SQLite
+
+Configuration & Validation
+
+python-dotenv
+
+Pydantic
+
+Version Control & Deployment
+
+Git
+
+GitHub
+
+Streamlit Community Cloud
+
+📁 Project Structure
+
 datta-ai/
 │
 ├── app.py
+├── requirements.txt
+├── README.md
+├── PROJECT_STATUS.md
+├── MANIFEST.txt
+├── .env.example
+├── .gitignore
+│
+├── .streamlit/
+│   └── config.toml
 │
 ├── src/
 │   ├── __init__.py
@@ -255,393 +242,250 @@ datta-ai/
 │   ├── architecture.md
 │   └── known_issues.md
 │
-├── .streamlit/
-│   └── config.toml
-│
 ├── data/
 │   └── datta_ai.db
 │
-├── logs/
-│
-├── .env.example
-├── .gitignore
-├── MANIFEST.txt
-├── PROJECT_STATUS.md
-├── README.md
-└── requirements.txt
-```
+└── logs/
 
----
+data/, logs/, .env, and other local/runtime files are excluded from version control where appropriate.
 
-## 🛠️ Technology Stack
+🔐 Security
 
-| Category             | Technology                |
-| -------------------- | ------------------------- |
-| Frontend             | Streamlit                 |
-| Programming Language | Python 3.12               |
-| LLM                  | Groq                      |
-| Model                | `openai/gpt-oss-120b`     |
-| Agent Framework      | LangGraph                 |
-| LLM Framework        | LangChain                 |
-| Web Search           | DDGS                      |
-| Database             | SQLite                    |
-| Configuration        | python-dotenv             |
-| Validation           | Pydantic                  |
-| Authentication       | PBKDF2-HMAC-SHA256        |
-| Deployment           | Streamlit Community Cloud |
-| Version Control      | Git + GitHub              |
+API credentials are deliberately kept outside the Git repository.
 
----
+Local development
 
-## ⚙️ Local Setup
+Use a .env file:
 
-### 1. Clone the repository
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=openai/gpt-oss-120b
+GROQ_TEMPERATURE=0.0
 
-```bash
+Streamlit Cloud
+
+The deployed application reads the Groq credential from Streamlit Secrets.
+
+The real API key is not stored in GitHub.
+
+The repository contains only:
+
+.env.example
+
+with placeholder configuration.
+
+⚙️ Run Locally
+
+1. Clone
+
 git clone https://github.com/Tapandat/datta-ai.git
-```
-
-```bash
 cd datta-ai
-```
 
----
-
-### 2. Create a virtual environment
+2. Create virtual environment
 
 Windows:
 
-```powershell
 python -m venv venv
-```
+.env\Scripts\Activate.ps1
 
-Activate it:
+Linux/macOS:
 
-```powershell
-.\venv\Scripts\Activate.ps1
-```
-
-Linux / macOS:
-
-```bash
 python3 -m venv venv
 source venv/bin/activate
-```
 
----
+3. Install dependencies
 
-### 3. Install dependencies
-
-```bash
 python -m pip install -r requirements.txt
-```
 
----
+4. Configure environment
 
-### 4. Configure environment variables
+Create .env:
 
-Create a `.env` file in the project root.
-
-Example:
-
-```env
 APP_ENV=development
-
 DEBUG=false
-
 LOG_LEVEL=INFO
 
 GROQ_API_KEY=your_groq_api_key_here
-
 GROQ_MODEL=openai/gpt-oss-120b
-
 GROQ_TEMPERATURE=0.0
 
 SEARCH_MAX_RESULTS=8
-
 MAX_RESEARCH_ROUNDS=1
 
 DATABASE_PATH=data/datta_ai.db
 
 LOG_FILE=logs/datta_ai.log
-
 LOG_MAX_BYTES=5242880
-
 LOG_BACKUP_COUNT=3
-```
 
-Never commit your real `.env` file.
+5. Start the application
 
----
-
-### 5. Run the application
-
-```bash
 streamlit run app.py
-```
 
-The application will be available locally at:
+Open:
 
-```text
 http://localhost:8501
-```
 
----
+🧪 Validation
 
-## ☁️ Deployment
+The application components can be checked with:
 
-datta.ai is deployed using **Streamlit Community Cloud**.
-
-Deployment configuration:
-
-```text
-Repository: Tapandat/datta-ai
-Branch: main
-Entry Point: app.py
-Python: 3.12
-```
-
-The Groq API key is stored using Streamlit Cloud Secrets rather than being committed to the repository.
-
----
-
-## 🔐 Environment Variables
-
-| Variable              | Purpose                     |
-| --------------------- | --------------------------- |
-| `GROQ_API_KEY`        | Groq API authentication     |
-| `GROQ_MODEL`          | Active LLM model            |
-| `GROQ_TEMPERATURE`    | LLM generation temperature  |
-| `APP_ENV`             | Application environment     |
-| `DEBUG`               | Debug mode                  |
-| `LOG_LEVEL`           | Logging level               |
-| `SEARCH_MAX_RESULTS`  | Maximum web search results  |
-| `MAX_RESEARCH_ROUNDS` | Research iteration limit    |
-| `DATABASE_PATH`       | SQLite database location    |
-| `LOG_FILE`            | Log file location           |
-| `LOG_MAX_BYTES`       | Maximum log file size       |
-| `LOG_BACKUP_COUNT`    | Number of rotated log files |
-
----
-
-## 🧪 Testing
-
-The project includes validation for the major application components.
-
-Example compilation test:
-
-```bash
 python -m py_compile src/config.py src/logger.py src/errors.py src/llm.py src/search.py src/graph.py app.py
-```
 
-The following components have been tested during development:
+The development workflow also validates:
 
-* Configuration loading
-* Groq LLM connection
-* Web search
-* Research graph compilation
-* Research execution
-* Report generation
-* Streamlit UI
-* Authentication
-* Research history
-* Error handling
-* Logging
+Configuration loading
 
----
+Groq connectivity
 
-## 🔄 Research Pipeline
+Web search
 
-A typical research request follows this process:
+Research graph compilation
 
-```text
-1. User enters research question
-              ↓
-2. Research planning
-              ↓
-3. Search query generation
-              ↓
-4. Web search
-              ↓
-5. Source classification
-              ↓
-6. Credibility evaluation
-              ↓
-7. Evidence extraction
-              ↓
-8. Claim/source matching
-              ↓
-9. Evidence confidence analysis
-              ↓
-10. Final report synthesis
-              ↓
-11. Sources and citations
-```
+Research execution
 
----
+Report generation
 
-## 📊 Source Evaluation
+Streamlit UI
 
-The search component considers several characteristics when processing sources.
+Authentication
 
-### Source Type
+Research history
 
-Examples include:
+Error handling
 
-```text
+Logging
+
+📊 Source Credibility
+
+datta.ai does not treat every search result as equivalent.
+
+The search layer extracts metadata and uses heuristic signals to help rank sources.
+
+Examples of source categories include:
+
 Government
-Academic
-Research Organization
+Academic / Research
 News
 Technology
 Commercial
-General Website
-```
+General Web
 
-### Evidence Signals
+Additional signals include:
 
-The system considers:
-
-```text
-Source relevance
-Source credibility
-Source specificity
-Source recency
-Primary-source availability
+Relevance
+Recency
+Specificity
+Source type
+Primary-source preference
+Domain reputation
 Source diversity
-```
 
-These signals help the research workflow distinguish between different types of web sources.
+These are heuristics, not a guarantee that a source is objectively correct.
 
----
+Users should still inspect the original sources before relying on important information.
 
-## 🔒 Security Considerations
+💡 Design Principles
 
-The project follows several security practices:
+Evidence before synthesis
 
-* API keys are stored outside source code.
-* `.env` is excluded from Git.
-* Streamlit secrets are not committed.
-* Virtual environments are excluded.
-* Local databases are excluded from Git.
-* Logs are excluded from Git.
-* Common credential and certificate files are ignored.
-* API-key patterns are redacted from application logs.
-* Passwords are hashed rather than stored directly.
+The agent first gathers information and then generates the final report.
 
----
+Separation of responsibilities
 
-## ⚠️ Current Limitations
+The project separates:
 
-datta.ai is a portfolio/research project and has several limitations.
+UI
+Configuration
+LLM
+Search
+Tools
+Research Graph
+Logging
+Error Handling
 
-### Web Search Dependency
+This keeps the application modular and easier to maintain.
 
-Research quality depends partly on the availability and quality of web search results.
+Secure configuration
 
-### LLM Dependency
+Secrets are separated from source code.
 
-The quality of generated reports depends on the configured LLM and the evidence supplied to it.
+Deployment readiness
 
-### Source Evaluation
+The same configuration system supports local .env usage and Streamlit Cloud secrets.
 
-Source credibility scoring uses heuristic signals. It should not be treated as a definitive measure of source reliability.
+⚠️ Limitations
 
-### SQLite Persistence
+datta.ai is a portfolio/research project and should not be treated as an authoritative source by itself.
 
-The current application uses SQLite for local user and research history.
+Search limitations
 
-For a larger production deployment, a managed database such as PostgreSQL would be more appropriate.
+Web search availability and result quality can affect the research output.
 
-### Authentication
+LLM limitations
 
-The current authentication system is designed for this project and demonstration environment. A production-scale application would require additional identity, session, rate-limiting, and security controls.
+Generated text can contain errors or incomplete interpretations even when sources are provided.
 
----
+Credibility heuristics
 
-## 🚧 Future Improvements
+Source scoring is based on heuristic signals and should not be interpreted as a definitive measure of truthfulness.
 
-Potential future enhancements include:
+Current storage
 
-* [ ] PostgreSQL-based persistent storage
-* [ ] Production-grade authentication
-* [ ] OAuth providers
-* [ ] Background research jobs
-* [ ] Research result export to PDF
-* [ ] Research result export to Markdown
-* [ ] More advanced citation verification
-* [ ] Multi-agent research workflows
-* [ ] Improved source credibility modeling
-* [ ] Semantic source clustering
-* [ ] Research comparison mode
-* [ ] Long-term research projects
-* [ ] User-configurable research depth
-* [ ] More LLM provider options
-* [ ] Automated evaluation benchmarks
-* [ ] Unit and integration test suite
-* [ ] Docker deployment
-* [ ] Cloud database integration
+The current implementation uses SQLite. A larger production deployment would benefit from a managed database such as PostgreSQL.
 
----
+Authentication
 
-## 🎯 Why I Built This
+The current authentication implementation is designed for this project/demo environment and would require additional controls for a large-scale production service.
 
-The goal of datta.ai is to explore how modern AI agent architectures can move beyond simple question-answering systems.
+🚀 Future Roadmap
 
-The project focuses on combining:
+□ PostgreSQL / managed database
+□ Production-grade authentication
+□ OAuth providers
+□ PDF / Markdown report export
+□ Advanced citation verification
+□ Semantic source clustering
+□ Multi-agent research
+□ Research comparison mode
+□ User-configurable research depth
+□ Additional LLM providers
+□ Automated evaluation benchmarks
+□ Docker deployment
+□ Background research jobs
 
-```text
-LLMs
-+
-Web Search
-+
-Agentic Workflows
-+
-Evidence Analysis
-+
-Source Credibility
-+
-Structured Report Generation
-```
+🎯 Project Goal
 
-into a single research workflow.
+The project explores how an AI application can move from:
 
----
+"Ask an LLM a question"
 
-## 👨‍💻 Author
+towards:
 
-**Tapan Datta**
+"Investigate the question,
+collect evidence,
+evaluate sources,
+connect claims to evidence,
+and synthesize a structured report."
 
-B.Tech Computer Science Engineering
+The focus is on combining LLMs + web search + agentic workflows + evidence analysis + structured reporting in a deployable application.
+
+👨‍💻 Author
+
+Tapan Datta
+
+B.Tech — Computer Science Engineering
 
 GitHub:
+https://github.com/Tapandat
 
-[https://github.com/Tapandat](https://github.com/Tapandat)
+Project:
+https://github.com/Tapandat/datta-ai
 
----
+Live Demo:
+https://datta-ai-gkp48r6cwrmrkft7rfgxk7.streamlit.app/
 
-## ⭐ Project
+⭐ Try It
 
-If you find the project useful or interesting, consider giving the repository a ⭐ on GitHub.
+🚀 Launch datta.ai
 
-**Live Application:**
-
-[https://datta-ai-gkp48r6cwrmrkft7rfgxk7.streamlit.app/](https://datta-ai-gkp48r6cwrmrkft7rfgxk7.streamlit.app/)
-
-**GitHub Repository:**
-
-[https://github.com/Tapandat/datta-ai](https://github.com/Tapandat/datta-ai)
-
-````
-
-### After replacing `README.md`
-
-Run:
-
-```powershell
-git add README.md
-git commit -m "Improve project documentation"
-git push
-````
-
-That will update the **`datta-ai` GitHub repository** with the portfolio-ready README.
+If you find the project interesting, feel free to explore the repository and ⭐ the project.
