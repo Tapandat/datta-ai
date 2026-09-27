@@ -2,6 +2,7 @@
 
 All environment-driven settings are loaded here so the rest of the
 application does not need to read environment variables directly.
+Supports both local .env configuration and Streamlit Cloud secrets.
 """
 
 from dataclasses import dataclass
@@ -21,13 +22,35 @@ load_dotenv(BASE_DIR / ".env")
 
 
 # ============================================================
-# Environment Helpers
+# Secret / Environment Helpers
 # ============================================================
 
-def _get_int(name: str, default: int) -> int:
-    """Read an integer environment variable."""
+def _get_value(name: str, default: str = "") -> str:
+    """Read a setting from environment variables or Streamlit secrets."""
 
-    value = os.getenv(name, str(default)).strip()
+    value = os.getenv(name)
+
+    if value is not None:
+        return value.strip()
+
+    try:
+        import streamlit as st
+
+        value = st.secrets.get(name, default)
+
+        if value is None:
+            return default
+
+        return str(value).strip()
+
+    except Exception:
+        return default
+
+
+def _get_int(name: str, default: int) -> int:
+    """Read an integer setting."""
+
+    value = _get_value(name, str(default))
 
     try:
         return int(value)
@@ -38,9 +61,9 @@ def _get_int(name: str, default: int) -> int:
 
 
 def _get_float(name: str, default: float) -> float:
-    """Read a floating-point environment variable."""
+    """Read a floating-point setting."""
 
-    value = os.getenv(name, str(default)).strip()
+    value = _get_value(name, str(default))
 
     try:
         return float(value)
@@ -51,12 +74,12 @@ def _get_float(name: str, default: float) -> float:
 
 
 def _get_bool(name: str, default: bool) -> bool:
-    """Read a boolean environment variable."""
+    """Read a boolean setting."""
 
-    value = os.getenv(
+    value = _get_value(
         name,
         str(default),
-    ).strip().lower()
+    ).lower()
 
     if value in {"1", "true", "yes", "on"}:
         return True
@@ -111,30 +134,30 @@ class Settings:
 # ============================================================
 
 settings = Settings(
-    environment=os.getenv(
+    environment=_get_value(
         "APP_ENV",
         "development",
-    ).strip().lower(),
+    ).lower(),
 
     debug=_get_bool(
         "DEBUG",
         False,
     ),
 
-    log_level=os.getenv(
+    log_level=_get_value(
         "LOG_LEVEL",
         "INFO",
-    ).strip().upper(),
+    ).upper(),
 
-    groq_api_key=os.getenv(
+    groq_api_key=_get_value(
         "GROQ_API_KEY",
         "",
-    ).strip(),
+    ),
 
-    groq_model=os.getenv(
+    groq_model=_get_value(
         "GROQ_MODEL",
         "openai/gpt-oss-120b",
-    ).strip(),
+    ),
 
     groq_temperature=_get_float(
         "GROQ_TEMPERATURE",
@@ -152,14 +175,14 @@ settings = Settings(
     ),
 
     database_path=_resolve_path(
-        os.getenv(
+        _get_value(
             "DATABASE_PATH",
             "data/datta_ai.db",
         )
     ),
 
     log_file=_resolve_path(
-        os.getenv(
+        _get_value(
             "LOG_FILE",
             "logs/datta_ai.log",
         )
@@ -193,10 +216,15 @@ if not settings.log_level:
     )
 
 
+if not settings.groq_api_key:
+    raise ValueError(
+        "GROQ_API_KEY is not configured."
+    )
+
+
 if settings.groq_api_key.lower().startswith("your_"):
     raise ValueError(
-        "GROQ_API_KEY still contains the placeholder value. "
-        "Add your real Groq API key to .env."
+        "GROQ_API_KEY still contains the placeholder value."
     )
 
 
