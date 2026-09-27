@@ -1,0 +1,17 @@
+datta.ai complete snapshot — 2026-09-26
+
+.env.example
+.gitignore
+PROJECT_STATUS.md
+README.md
+app.py
+backup_versions/graph_previous.py
+history/architecture.md
+history/known_issues.md
+requirements.txt
+src/__init__.py
+src/agent.py
+src/graph.py
+src/llm.py
+src/search.py
+src/tools.py
