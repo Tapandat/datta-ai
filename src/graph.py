@@ -1,745 +1,2464 @@
+"""
+Research workflow for datta.ai.
+
+The graph is designed to:
+- classify the user's research question
+- create focused research sub-questions
+- search multiple sources in parallel
+- rank and deduplicate evidence
+- verify a compact evidence set with the LLM
+- generate an evidence-backed report
+- gracefully fall back when the LLM is temporarily unavailable
+"""
+
+from __future__ import annotations
+
 import json
 import re
+import time
 from typing import Annotated, TypedDict
-from urllib.parse import urlparse
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
+from src.errors import ResearchError
 from src.llm import get_response_text, llm
-from src.tools import search_web
 from src.logger import get_logger
+from src.search import web_search
 
 
 logger = get_logger("graph")
 
 
-# =========================================================
-# STATE
-# =========================================================
+# ============================================================
+# Constants
+# ============================================================
 
-def merge_lists(left, right):
-    return left + right
+MAX_PLAN_QUESTIONS = 4
+MAX_SEARCH_RESULTS_PER_QUERY = 6
+MAX_TOTAL_SOURCES = 12
+
+MAX_VERIFICATION_SOURCES = 6
+MAX_VERIFIED_CLAIMS = 6
+
+MAX_SNIPPET_CHARS = 360
+MAX_SOURCE_TITLE_CHARS = 150
+
+MIN_LLM_INTERVAL_SECONDS = 1.5
+
+_LAST_LLM_CALL = 0.0
 
 
-class ResearchState(TypedDict):
+# ============================================================
+# State
+# ============================================================
+
+class ResearchState(TypedDict, total=False):
     question: str
+
+    question_type: str
+    topic: str
+    context: str
+
     sub_questions: list[str]
-    search_results: Annotated[list[str], merge_lists]
-    sources: Annotated[list[dict], merge_lists]
-    verified_evidence: list[dict]
-    research_round: int
     max_research_rounds: int
-    research_complete: bool
-    verification_failed: bool
+
+    search_results: Annotated[
+        list[dict],
+        lambda left, right: left + right,
+    ]
+
+    sources: list[dict]
+    verification_sources: list[dict]
+
+    evidence: list[dict]
+
+    verification_status: str
+
     answer: str
 
 
-class SearchState(TypedDict):
-    question: str
-    result: Annotated[list[str], merge_lists]
-    sources: Annotated[list[dict], merge_lists]
+class SearchState(TypedDict, total=False):
+    """
+    State passed to an individual parallel search worker.
+
+    The query is input-only for the worker and is deliberately
+    not returned into the shared graph state. This prevents
+    concurrent 'query' updates from colliding in LangGraph.
+    """
+
+    query: str
+    results: list[dict]
 
 
-# =========================================================
-# TEXT / JSON HELPERS
-# =========================================================
+# ============================================================
+# Text Helpers
+# ============================================================
 
-def normalize_text(value: str) -> str:
-    value = str(value or "").lower()
-    value = value.replace("–", "-").replace("—", "-").replace("−", "-")
-    value = value.replace("“", '"').replace("”", '"')
-    value = value.replace("’", "'").replace("\u00a0", " ")
-    return re.sub(r"\s+", " ", value).strip()
+def clean_text(value: object) -> str:
+    """Normalize arbitrary values into compact plain text."""
+
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
 
 
-def extract_json(text: str):
-    """Extract the first valid JSON array/object from an LLM response."""
-    text = str(text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```$", "", text)
+def normalize_topic(value: str) -> str:
+    """Clean a topic extracted from a natural-language question."""
+
+    topic = clean_text(value)
+
+    topic = re.sub(
+        r"^(what|why|how|when|where|which|who)\s+",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"^(is|are|was|were|does|do|did|can|could|would|should)\s+",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"^to\s+implement\s+",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"^i\s+implement\s+",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"^implement\s+",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"\s+work\b.*$",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"\s+is\s+used\b.*$",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"^the\s+difference\s+between\s+",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"\s+and\s+how\b.*$",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"\s+and\s+what\b.*$",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"\s+in\s+real[- ]world.*$",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = re.sub(
+        r"\s+for\s+real[- ]world.*$",
+        "",
+        topic,
+        flags=re.IGNORECASE,
+    )
+
+    topic = topic.strip(
+        " ?.,:;"
+    )
+
+    return topic or "the requested topic"
+
+
+def shorten(
+    value: str,
+    limit: int,
+) -> str:
+    """Limit text length while keeping complete-looking content."""
+
+    text = clean_text(
+        value
+    )
+
+    if len(text) <= limit:
+        return text
+
+    return (
+        text[:limit]
+        .rstrip()
+        + "..."
+    )
+
+
+# ============================================================
+# Question Classification
+# ============================================================
+
+def classify_question(
+    question: str,
+) -> str:
+    """Classify a research question."""
+
+    text = clean_text(
+        question
+    ).lower()
+
+    comparison_terms = (
+        "difference between",
+        "compare",
+        "comparison",
+        "versus",
+        "vs.",
+        " vs ",
+    )
+
+    forecasting_terms = (
+        "forecast",
+        "forecasting",
+        "predict future",
+        "future values",
+        "time series prediction",
+    )
+
+    implementation_terms = (
+        "how to implement",
+        "implementation",
+        "implement",
+        "build",
+        "develop",
+        "create",
+        "deploy",
+        "deployment",
+        "code for",
+        "program for",
+    )
+
+    if any(
+        term in text
+        for term in comparison_terms
+    ):
+        return "comparison"
+
+    if any(
+        term in text
+        for term in forecasting_terms
+    ):
+        return "forecasting"
+
+    if any(
+        term in text
+        for term in implementation_terms
+    ):
+        return "implementation"
+
+    return "concept"
+
+
+# ============================================================
+# Topic / Context Extraction
+# ============================================================
+
+def extract_topic_and_context(
+    question: str,
+) -> tuple[str, str]:
+    """
+    Extract the main topic and optional context.
+
+    Examples:
+
+    What is machine learning and how is it used in
+    real-world applications?
+        -> machine learning
+        -> used in real-world applications
+
+    How do I implement a machine learning model?
+        -> machine learning
+
+    How does ARIMA work for time series forecasting?
+        -> ARIMA
+
+    What is the difference between supervised and
+    unsupervised learning?
+        -> supervised and unsupervised learning
+    """
+
+    text = clean_text(
+        question
+    ).rstrip("?").strip()
+
+    # --------------------------------------------------------
+    # Comparison
+    # --------------------------------------------------------
+
+    difference_match = re.search(
+        r"difference\s+between\s+(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if difference_match:
+        topic = difference_match.group(1)
+
+        return (
+            normalize_topic(topic),
+            "",
+        )
+
+    # --------------------------------------------------------
+    # Implementation
+    # --------------------------------------------------------
+
+    implementation_match = re.search(
+        r"implement\s+(?:a|an|the)?\s*(.+?)(?:\s+model)?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if (
+        implementation_match
+        and classify_question(text)
+        == "implementation"
+    ):
+        topic = implementation_match.group(1)
+
+        return (
+            normalize_topic(topic),
+            "",
+        )
+
+    # --------------------------------------------------------
+    # "How does X work..."
+    # --------------------------------------------------------
+
+    how_does_match = re.search(
+        r"^how\s+does\s+(.+?)\s+work\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if how_does_match:
+        topic = how_does_match.group(1)
+
+        return (
+            normalize_topic(topic),
+            "",
+        )
+
+    # --------------------------------------------------------
+    # "What is X and how..."
+    # --------------------------------------------------------
+
+    and_how_match = re.search(
+        r"^what\s+is\s+(.+?)\s+and\s+how\s+(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if and_how_match:
+        topic = and_how_match.group(1)
+        context = and_how_match.group(2)
+
+        context = re.sub(
+            r"^is\s+",
+            "",
+            context,
+            flags=re.IGNORECASE,
+        )
+
+        context = re.sub(
+            r"^are\s+",
+            "",
+            context,
+            flags=re.IGNORECASE,
+        )
+
+        context = re.sub(
+            r"^it\s+",
+            "",
+            context,
+            flags=re.IGNORECASE,
+        )
+
+        # Normalize the full "is it used in ..." construction.
+        context = re.sub(
+            r"^it\s+is\s+used\s+in\s+",
+            "",
+            context,
+            flags=re.IGNORECASE,
+        )
+
+        context = re.sub(
+            r"^it\s+used\s+in\s+",
+            "",
+            context,
+            flags=re.IGNORECASE,
+        )
+
+        context = re.sub(
+            r"^is\s+used\s+in\s+",
+            "",
+            context,
+            flags=re.IGNORECASE,
+        )
+
+        context = re.sub(
+            r"^used\s+in\s+",
+            "",
+            context,
+            flags=re.IGNORECASE,
+        )
+
+        context = re.sub(
+            r"^it\s+",
+            "",
+            context,
+            flags=re.IGNORECASE,
+        )
+
+        context = context.strip(
+            " ?.,:;"
+        )
+
+        return (
+            normalize_topic(topic),
+            context,
+        )
+
+    # --------------------------------------------------------
+    # "What is X?"
+    # --------------------------------------------------------
+
+    what_is_match = re.search(
+        r"^what\s+is\s+(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if what_is_match:
+        topic = what_is_match.group(1)
+
+        return (
+            normalize_topic(topic),
+            "",
+        )
+
+    # --------------------------------------------------------
+    # "How do I..."
+    # --------------------------------------------------------
+
+    how_do_match = re.search(
+        r"^how\s+do\s+i\s+(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if how_do_match:
+        topic = how_do_match.group(1)
+
+        topic = re.sub(
+            r"^implement\s+",
+            "",
+            topic,
+            flags=re.IGNORECASE,
+        )
+
+        topic = re.sub(
+            r"^build\s+",
+            "",
+            topic,
+            flags=re.IGNORECASE,
+        )
+
+        topic = re.sub(
+            r"^develop\s+",
+            "",
+            topic,
+            flags=re.IGNORECASE,
+        )
+
+        return (
+            normalize_topic(topic),
+            "",
+        )
+
+    # --------------------------------------------------------
+    # Generic fallback
+    # --------------------------------------------------------
+
+    return (
+        normalize_topic(text),
+        "",
+    )
+
+
+# ============================================================
+# JSON Helpers
+# ============================================================
+
+def extract_json_object(
+    text: str,
+) -> dict | None:
+    """Extract a JSON object from an LLM response."""
+
+    cleaned = clean_text(
+        text
+    )
+
+    if not cleaned:
+        return None
 
     try:
-        return json.loads(text)
+        parsed = json.loads(
+            cleaned
+        )
+
+        if isinstance(
+            parsed,
+            dict,
+        ):
+            return parsed
+
     except json.JSONDecodeError:
         pass
 
-    starts = [i for i in (text.find("["), text.find("{")) if i >= 0]
-    if not starts:
+    match = re.search(
+        r"\{.*\}",
+        text,
+        flags=re.DOTALL,
+    )
+
+    if not match:
         return None
 
-    start = min(starts)
-    for end in range(len(text), start, -1):
-        candidate = text[start:end].strip()
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
+    try:
+        parsed = json.loads(
+            match.group(0)
+        )
+
+        if isinstance(
+            parsed,
+            dict,
+        ):
+            return parsed
+
+    except json.JSONDecodeError:
+        return None
+
     return None
 
 
-def safe_llm_invoke(prompt: str):
-    """One LLM call; retry only a transient server failure once."""
-    try:
-        return llm.invoke(prompt)
-    except Exception as first_error:
-        message = str(first_error)
-        transient = any(
-            marker in message
-            for marker in ("429", "503", "500", "UNAVAILABLE", "rate_limit")
+# ============================================================
+# LLM Helpers
+# ============================================================
+
+def _wait_for_llm_slot() -> None:
+    """Serialize LLM calls to reduce rate-limit bursts."""
+
+    global _LAST_LLM_CALL
+
+    now = time.monotonic()
+
+    elapsed = (
+        now - _LAST_LLM_CALL
+    )
+
+    if elapsed < MIN_LLM_INTERVAL_SECONDS:
+        time.sleep(
+            MIN_LLM_INTERVAL_SECONDS
+            - elapsed
         )
-        # Do not retry rate-limit/quota errors. A retry only burns time
-        # and may consume another request when the provider is limited.
-        if "429" in message or "rate_limit" in message.lower():
-            logger.warning("Groq rate limit reached; no retry performed.")
+
+
+def safe_llm_call(
+    prompt: str,
+    *,
+    operation: str,
+) -> str | None:
+    """Call the configured LLM safely."""
+
+    global _LAST_LLM_CALL
+
+    _wait_for_llm_slot()
+
+    try:
+        response = llm.invoke(
+            prompt
+        )
+
+        _LAST_LLM_CALL = time.monotonic()
+
+        text = get_response_text(
+            response
+        ).strip()
+
+        if not text:
+            logger.warning(
+                "LLM returned empty response | operation=%s",
+                operation,
+            )
+
             return None
-        if transient:
-            logger.warning("Temporary Groq service error; retrying once...")
-            try:
-                return llm.invoke(prompt)
-            except Exception:
-                pass
-        logger.exception("Groq request failed | error_type=%s", type(first_error).__name__)
+
+        return text
+
+    except Exception as exc:
+        _LAST_LLM_CALL = time.monotonic()
+
+        error_text = str(
+            exc
+        ).lower()
+
+        if (
+            "429" in error_text
+            or "rate limit" in error_text
+            or "too many requests" in error_text
+            or "resource_exhausted" in error_text
+        ):
+            logger.warning(
+                "Groq rate limit reached | operation=%s",
+                operation,
+            )
+
+            return None
+
+        logger.exception(
+            "LLM call failed | operation=%s | error_type=%s",
+            operation,
+            type(exc).__name__,
+        )
+
         return None
 
 
-# =========================================================
-# SOURCE HELPERS
-# =========================================================
+# ============================================================
+# Source Helpers
+# ============================================================
 
-def normalize_url(url: str) -> str:
-    try:
-        parsed = urlparse(url.strip())
-        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
-    except Exception:
-        return url.strip().lower()
+def source_key(
+    source: dict,
+) -> str:
+    """Create a stable source identifier."""
+
+    url = clean_text(
+        source.get("url")
+        or source.get("link")
+        or ""
+    )
+
+    if url:
+        return url.lower().rstrip(
+            "/"
+        )
+
+    title = clean_text(
+        source.get("title")
+        or ""
+    )
+
+    domain = clean_text(
+        source.get("domain")
+        or ""
+    )
+
+    return (
+        f"{domain}|{title}"
+    ).lower()
 
 
-def deduplicate_sources(sources: list[dict]) -> list[dict]:
-    unique = []
+def prepare_source(
+    source: dict,
+) -> dict:
+    """Normalize a search result."""
+
+    return {
+        "title": shorten(
+            clean_text(
+                source.get(
+                    "title"
+                )
+            ),
+            MAX_SOURCE_TITLE_CHARS,
+        ),
+        "url": clean_text(
+            source.get("url")
+            or source.get("link")
+        ),
+        "domain": clean_text(
+            source.get(
+                "domain"
+            )
+        ),
+        "snippet": shorten(
+            clean_text(
+                source.get(
+                    "snippet"
+                )
+            ),
+            MAX_SNIPPET_CHARS,
+        ),
+        "source_type": clean_text(
+            source.get(
+                "source_type"
+            )
+        ),
+        "credibility_score": float(
+            source.get(
+                "credibility_score",
+                0.0,
+            )
+            or 0.0
+        ),
+        "quality": clean_text(
+            source.get(
+                "quality"
+            )
+        ),
+        "query_relevance_score": float(
+            source.get(
+                "query_relevance_score",
+                0.0,
+            )
+            or 0.0
+        ),
+    }
+
+
+def deduplicate_sources(
+    sources: list[dict],
+) -> list[dict]:
+    """Remove duplicate sources."""
+
     seen = set()
+    unique = []
+
     for source in sources:
-        url = str(source.get("url", "")).strip()
-        if not url:
+        key = source_key(
+            source
+        )
+
+        if not key or key in seen:
             continue
-        key = normalize_url(url)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(source)
+
+        seen.add(
+            key
+        )
+
+        unique.append(
+            source
+        )
+
     return unique
 
 
-def get_source_credibility(source: dict) -> float:
-    try:
-        return max(0.0, min(float(source.get("credibility_score", 0.40)), 1.0))
-    except (TypeError, ValueError):
-        return 0.40
+def select_sources(
+    sources: list[dict],
+    *,
+    limit: int,
+) -> list[dict]:
+    """Select diverse, high-quality sources."""
 
+    prepared = [
+        prepare_source(
+            source
+        )
+        for source in sources
+        if isinstance(
+            source,
+            dict,
+        )
+    ]
 
-def assign_source_ids(sources: list[dict]) -> list[dict]:
-    result = []
-    for index, source in enumerate(sources, 1):
-        result.append({
-            "id": index,
-            "title": str(source.get("title", "")).strip(),
-            "url": str(source.get("url", "")).strip(),
-            "domain": str(source.get("domain", "")).strip(),
-            "snippet": str(source.get("snippet", "")).strip(),
-            "quality": source.get("quality", "unknown"),
-            "source_type": source.get("source_type", "general_web"),
-            "source_level": source.get("source_level", "secondary"),
-            "domain_reputation": source.get("domain_reputation", 0.40),
-            "recency_score": source.get("recency_score"),
-            "specificity_score": source.get("specificity_score", 0.50),
-            "query_relevance_score": source.get("query_relevance_score", 0.50),
-            "credibility_score": source.get("credibility_score", 0.40),
-        })
-    return result
+    prepared = deduplicate_sources(
+        prepared
+    )
 
-
-def select_sources(sources: list[dict], limit: int = 16) -> list[dict]:
-    """Select strong evidence while preserving source diversity."""
-    sources = deduplicate_sources(sources)
-    ranked = sorted(
-        sources,
-        key=lambda s: (
-            get_source_credibility(s),
-            float(s.get("query_relevance_score", 0.50) or 0.50),
-            float(s.get("specificity_score", 0.50) or 0.50),
+    prepared.sort(
+        key=lambda item: (
+            item.get(
+                "credibility_score",
+                0.0,
+            ),
+            item.get(
+                "query_relevance_score",
+                0.0,
+            ),
         ),
         reverse=True,
     )
 
     selected = []
-    domain_counts = {}
+    domain_counts: dict[str, int] = {}
 
-    # Make room for primary evidence when it exists.
-    for source in ranked:
-        if source.get("source_level") == "primary":
-            selected.append(source)
-            domain = str(source.get("domain", ""))
-            domain_counts[domain] = domain_counts.get(domain, 0) + 1
-            break
+    for source in prepared:
+        domain = (
+            source.get(
+                "domain"
+            )
+            or "unknown"
+        ).lower()
 
-    # Prefer independent domains and avoid a single publisher dominating.
-    for source in ranked:
+        if domain_counts.get(
+            domain,
+            0,
+        ) >= 2:
+            continue
+
+        selected.append(
+            source
+        )
+
+        domain_counts[domain] = (
+            domain_counts.get(
+                domain,
+                0,
+            )
+            + 1
+        )
+
         if len(selected) >= limit:
             break
-        if source in selected:
-            continue
-        domain = str(source.get("domain", ""))
-        if domain_counts.get(domain, 0) >= 2:
-            continue
-        selected.append(source)
-        domain_counts[domain] = domain_counts.get(domain, 0) + 1
 
-    if len(selected) < limit:
-        for source in ranked:
-            if len(selected) >= limit:
-                break
-            if source not in selected:
-                selected.append(source)
-
-    return selected[:limit]
+    return selected
 
 
-# =========================================================
-# EVIDENCE GUARDRAILS
-# =========================================================
+# ============================================================
+# Evidence Helpers
+# ============================================================
 
-def extract_numbers(text: str) -> list[str]:
-    text = normalize_text(text)
-    matches = re.findall(
-        r"(?<![a-z])\$?\s*\d+(?:[.,]\d+)?"
-        r"(?:\s*(?:%|x|million|billion|trillion|m|bn|tn))?",
-        text,
-        flags=re.I,
+def build_evidence_payload(
+    sources: list[dict],
+) -> list[dict]:
+    """Build compact source data for verification."""
+
+    payload = []
+
+    for index, source in enumerate(
+        sources,
+        start=1,
+    ):
+        payload.append(
+            {
+                "id": index,
+                "title": shorten(
+                    source.get(
+                        "title",
+                        "",
+                    ),
+                    140,
+                ),
+                "domain": source.get(
+                    "domain",
+                    "",
+                ),
+                "snippet": shorten(
+                    source.get(
+                        "snippet",
+                        "",
+                    ),
+                    420,
+                ),
+                "url": source.get(
+                    "url",
+                    "",
+                ),
+            }
+        )
+
+    return payload
+
+
+def extract_claims(
+    verification: dict,
+) -> list[dict]:
+    """Normalize verified claims."""
+
+    raw_claims = verification.get(
+        "claims",
+        [],
     )
-    return [re.sub(r"\s+", "", x).replace(",", "") for x in matches]
 
+    if not isinstance(
+        raw_claims,
+        list,
+    ):
+        return []
 
-def numeric_claim_supported(claim: str, evidence: str) -> bool:
-    claim_numbers = extract_numbers(claim)
-    evidence_numbers = extract_numbers(evidence)
-    return all(number in evidence_numbers for number in claim_numbers)
+    claims = []
 
-
-def get_evidence_credibility(quotes: list[dict], source_map: dict) -> float:
-    """Score evidence using unique source domains rather than duplicate URLs."""
-    unique_sources = {}
-    for quote in quotes:
-        sid = quote.get("source_id")
-        if sid not in source_map:
+    for claim in raw_claims:
+        if not isinstance(
+            claim,
+            dict,
+        ):
             continue
-        source = source_map[sid]
-        domain = source.get("domain") or f"source-{sid}"
-        score = get_source_credibility(source)
-        unique_sources[domain] = max(unique_sources.get(domain, 0.0), score)
 
-    scores = list(unique_sources.values())
-    return round(sum(scores) / len(scores), 2) if scores else 0.0
+        text = clean_text(
+            claim.get(
+                "claim"
+            )
+        )
+
+        if not text:
+            continue
+
+        status = clean_text(
+            claim.get(
+                "status",
+                "supported",
+            )
+        ).lower()
+
+        if status not in {
+            "supported",
+            "partial",
+            "unsupported",
+        }:
+            status = "supported"
+
+        source_ids = claim.get(
+            "source_ids",
+            [],
+        )
+
+        if not isinstance(
+            source_ids,
+            list,
+        ):
+            source_ids = []
+
+        cleaned_source_ids = []
+
+        for source_id in source_ids:
+            try:
+                value = int(
+                    source_id
+                )
+
+                if value > 0:
+                    cleaned_source_ids.append(
+                        value
+                    )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        confidence = clean_text(
+            claim.get(
+                "confidence",
+                "medium",
+            )
+        ).lower()
+
+        if confidence not in {
+            "high",
+            "medium",
+            "low",
+        }:
+            confidence = "medium"
+
+        claims.append(
+            {
+                "claim": text,
+                "status": status,
+                "source_ids": cleaned_source_ids,
+                "confidence": confidence,
+            }
+        )
+
+    return claims[
+        :MAX_VERIFIED_CLAIMS
+    ]
 
 
-def rank_verified_evidence(items: list[dict]) -> list[dict]:
-    status = {"SUPPORTED": 3, "PARTIAL": 2, "UNSUPPORTED": 1}
-    confidence = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
-    return sorted(
-        items,
-        key=lambda x: (
-            status.get(x.get("status"), 0),
-            confidence.get(x.get("confidence"), 0),
-            x.get("evidence_credibility", 0),
+def supported_claims(
+    evidence: list[dict],
+) -> list[dict]:
+    """Return supported or partially supported evidence."""
+
+    return [
+        item
+        for item in evidence
+        if item.get(
+            "status"
+        )
+        in {
+            "supported",
+            "partial",
+        }
+        and item.get(
+            "source_ids"
+        )
+    ]
+
+
+# ============================================================
+# Research Planning
+# ============================================================
+
+def build_deterministic_plan(
+    question: str,
+) -> dict:
+    """Create a focused research plan."""
+
+    question_type = classify_question(
+        question
+    )
+
+    topic, context = (
+        extract_topic_and_context(
+            question
+        )
+    )
+
+    context_phrase = ""
+
+    if context:
+        context_phrase = (
+            f" with emphasis on {context}"
+        )
+
+    if question_type == "comparison":
+        sub_questions = [
+            (
+                f"What are the core definitions and "
+                f"characteristics of {topic}?"
+            ),
+            (
+                f"What are the main similarities and "
+                f"differences involving {topic}?"
+            ),
+            (
+                f"What practical use cases and "
+                f"trade-offs are documented for {topic}?"
+            ),
+            (
+                f"What limitations, risks, and evidence "
+                f"gaps are documented for {topic}?"
+            ),
+        ]
+
+    elif question_type == "forecasting":
+        sub_questions = [
+            (
+                f"What are the fundamental concepts "
+                f"behind {topic}{context_phrase}?"
+            ),
+            (
+                f"How does {topic} work and what methods "
+                f"are commonly used{context_phrase}?"
+            ),
+            (
+                f"What evidence exists about forecasting "
+                f"performance and practical applications "
+                f"of {topic}?"
+            ),
+            (
+                f"What limitations, assumptions, risks, "
+                f"and evidence gaps affect {topic}?"
+            ),
+        ]
+
+    elif question_type == "implementation":
+        sub_questions = [
+            (
+                f"What are the fundamental concepts "
+                f"behind {topic}{context_phrase}?"
+            ),
+            (
+                f"What methods, tools, architectures, "
+                f"or frameworks are commonly used for {topic}?"
+            ),
+            (
+                f"What implementation steps, requirements, "
+                f"and best practices are documented for {topic}?"
+            ),
+            (
+                f"What limitations, risks, and common "
+                f"implementation problems are documented?"
+            ),
+        ]
+
+    else:
+        if context:
+            practical_question = (
+                f"How is {topic} used in {context}?"
+            )
+        else:
+            practical_question = (
+                f"What practical applications, benefits, "
+                f"and real-world uses of {topic} are documented?"
+            )
+
+        sub_questions = [
+            (
+                f"What is {topic} and what are its "
+                f"fundamental concepts?"
+            ),
+            (
+                f"How does {topic} work, and what methods "
+                f"or mechanisms are commonly used?"
+            ),
+            practical_question,
+            (
+                f"What limitations, risks, challenges, "
+                f"and evidence gaps are documented about {topic}?"
+            ),
+        ]
+
+    return {
+        "question_type": question_type,
+        "topic": topic,
+        "context": context,
+        "sub_questions": sub_questions[
+            :MAX_PLAN_QUESTIONS
+        ],
+        "max_research_rounds": 1,
+    }
+
+
+def plan_research(
+    state: ResearchState,
+) -> ResearchState:
+    """Create the research plan."""
+
+    question = clean_text(
+        state.get(
+            "question"
+        )
+    )
+
+    if not question:
+        raise ResearchError(
+            "Research question is empty.",
+            user_message=(
+                "Please enter a research question."
+            ),
+        )
+
+    plan = build_deterministic_plan(
+        question
+    )
+
+    print()
+    print(
+        "🔎 RESEARCH PLAN"
+    )
+    print(
+        f"Question type: "
+        f"{plan['question_type']}"
+    )
+    print(
+        f"Topic: "
+        f"{plan['topic']}"
+    )
+
+    if plan["context"]:
+        print(
+            f"Context: "
+            f"{plan['context']}"
+        )
+
+    for index, sub_question in enumerate(
+        plan["sub_questions"],
+        start=1,
+    ):
+        print(
+            f"{index}. {sub_question}"
+        )
+
+    print(
+        "ℹ️ Planning used no LLM request."
+    )
+
+    logger.info(
+        "Research plan created | type=%s | topic=%s | sub_questions=%d",
+        plan["question_type"],
+        plan["topic"],
+        len(
+            plan["sub_questions"]
+        ),
+    )
+
+    return {
+        **state,
+        **plan,
+    }
+
+
+# ============================================================
+# Parallel Search
+# ============================================================
+
+def dispatch_searches(
+    state: ResearchState,
+):
+    """Dispatch one search per research sub-question."""
+
+    sub_questions = state.get(
+        "sub_questions",
+        [],
+    )
+
+    return [
+        Send(
+            "search",
+            {
+                "query": question,
+            },
+        )
+        for question in sub_questions
+    ]
+
+
+def search_node(
+    state: SearchState,
+) -> dict:
+    """
+    Execute one web search.
+
+    Important:
+    The worker receives 'query' and returns its results through
+    the parent state's reducer-backed 'search_results' key.
+    Returning a plain 'results' key would cause concurrent state
+    updates to collide because multiple Send branches execute together.
+    """
+
+    query = clean_text(
+        state.get(
+            "query"
+        )
+    )
+
+    if not query:
+        return {
+            "search_results": [],
+        }
+
+    print()
+    print(
+        f"🌐 Searching: {query}"
+    )
+
+    try:
+        results = web_search(
+            query,
+            max_results=MAX_SEARCH_RESULTS_PER_QUERY,
+        )
+
+        return {
+            "search_results": results or [],
+        }
+
+    except Exception as exc:
+        logger.exception(
+            "Search node failed | error_type=%s",
+            type(exc).__name__,
+        )
+
+        return {
+            "search_results": [],
+        }
+
+
+def collect_search_results(
+    state: ResearchState,
+) -> ResearchState:
+    """Collect and rank all search results."""
+
+    raw_sources = state.get(
+        "search_results",
+        [],
+    )
+
+    selected = select_sources(
+        raw_sources,
+        limit=MAX_TOTAL_SOURCES,
+    )
+
+    print()
+    print(
+        f"📚 Unique sources collected: "
+        f"{len(selected)}"
+    )
+
+    logger.info(
+        "Search collection completed | sources=%d",
+        len(selected),
+    )
+
+    return {
+        **state,
+        "sources": selected,
+    }
+
+
+# ============================================================
+# Evidence Verification
+# ============================================================
+
+def build_verification_prompt(
+    question: str,
+    sources: list[dict],
+) -> str:
+    """Build a compact verification prompt."""
+
+    payload = build_evidence_payload(
+        sources
+    )
+
+    return f"""
+You are the evidence verifier for datta.ai.
+
+Research question:
+{question}
+
+Use ONLY the supplied sources.
+
+Identify important factual claims that directly answer the research question.
+Prioritize definitions, mechanisms, applications, findings, limitations, and other substantive facts.
+Do NOT prioritize tangential market-size, promotional, navigation, section-summary, or article-description text unless the question explicitly asks for it.
+
+Do not use outside knowledge.
+Do not invent facts.
+Do not make predictions.
+Do not combine unrelated sources.
+
+Return ONLY valid JSON:
+
+{{
+  "claims": [
+    {{
+      "claim": "short factual claim",
+      "status": "supported",
+      "source_ids": [1],
+      "confidence": "high"
+    }}
+  ]
+}}
+
+Rules:
+- status must be supported, partial, or unsupported.
+- Include only claims with source_ids.
+- Prefer supported claims.
+- Maximum 6 claims.
+- Each claim must be under 35 words.
+- confidence must be high, medium, or low.
+- If evidence is insufficient, omit the claim.
+
+Sources:
+{json.dumps(
+    payload,
+    ensure_ascii=False,
+)}
+""".strip()
+
+
+def verify_evidence(
+    state: ResearchState,
+) -> ResearchState:
+    """Verify a compact set of evidence."""
+
+    sources = select_sources(
+        state.get(
+            "sources",
+            [],
+        ),
+        limit=MAX_VERIFICATION_SOURCES,
+    )
+
+    if not sources:
+        print()
+        print(
+            "🔍 VERIFYING EVIDENCE..."
+        )
+        print(
+            "⚠️ No usable sources available for verification."
+        )
+
+        return {
+            **state,
+            "evidence": [],
+            "verification_sources": [],
+            "verification_status": "no_sources",
+        }
+
+    print()
+    print(
+        "🔍 VERIFYING EVIDENCE..."
+    )
+
+    prompt = build_verification_prompt(
+        state["question"],
+        sources,
+    )
+
+    response_text = safe_llm_call(
+        prompt,
+        operation="evidence_verification",
+    )
+
+    if not response_text:
+        print(
+            "   ⚠️ Evidence verification was unavailable."
+        )
+        print(
+            "   ↪ Falling back to deterministic source-backed evidence."
+        )
+
+        fallback_evidence = (
+            build_fallback_evidence(
+                sources,
+                state.get("question", ""),
+            )
+        )
+
+        return {
+            **state,
+            "verification_sources": sources,
+            "evidence": fallback_evidence,
+            "verification_status": "fallback",
+        }
+
+    verification = extract_json_object(
+        response_text
+    )
+
+    if not verification:
+        logger.warning(
+            "Verifier returned invalid JSON."
+        )
+
+        print(
+            "   ⚠️ Evidence verifier returned invalid structured output."
+        )
+        print(
+            "   ↪ Falling back to deterministic source-backed evidence."
+        )
+
+        fallback_evidence = (
+            build_fallback_evidence(
+                sources,
+                state.get("question", ""),
+            )
+        )
+
+        return {
+            **state,
+            "verification_sources": sources,
+            "evidence": fallback_evidence,
+            "verification_status": "fallback",
+        }
+
+    evidence = extract_claims(
+        verification
+    )
+
+    evidence = [
+        item
+        for item in evidence
+        if item.get(
+            "source_ids"
+        )
+    ]
+
+    if not evidence:
+        print(
+            "   ⚠️ No supported claims were returned by verification."
+        )
+        print(
+            "   ↪ Falling back to deterministic source-backed evidence."
+        )
+
+        fallback_evidence = (
+            build_fallback_evidence(
+                sources,
+                state.get("question", ""),
+            )
+        )
+
+        return {
+            **state,
+            "sources": sources,
+            "evidence": fallback_evidence,
+            "verification_status": "fallback",
+        }
+
+    print(
+        f"   ✓ Claims verified: "
+        f"{len(evidence)}"
+    )
+
+    logger.info(
+        "Evidence verification completed | claims=%d",
+        len(evidence),
+    )
+
+    return {
+        **state,
+        "verification_sources": sources,
+        "evidence": evidence,
+        "verification_status": "verified",
+    }
+
+
+def _fallback_candidate_sentences(text: str) -> list[str]:
+    """Extract substantive sentences from a search snippet."""
+
+    text = clean_text(text)
+    if not text:
+        return []
+
+    # Remove common search-result metadata and promotional prefixes.
+    text = re.sub(
+        r"^(?:\w{3}\s+\d{1,2},\s+\d{4}\s*[·•-]\s*)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s*[·•-]\s*",
+        "",
+        text,
+    )
+
+    parts = re.split(r"(?<=[.!?])\s+|\s*[•|]\s*", text)
+    candidates = []
+
+    reject_patterns = (
+        r"^section\s+\d",
+        r"^chapter\s+\d",
+        r"^explore\s+how\b",
+        r"^dive\s+into\b",
+        r"^discover\s+why\b",
+        r"^here\s+are\b",
+        r"^learn\s+more\b",
+        r"^you\s+will\s+learn\b",
+        r"^this\s+article\s+(?:explains|discusses|covers)\b",
+        r"^this\s+(?:page|guide|post)\s+(?:explains|discusses|covers)\b",
+        r"^read\s+more\b",
+        r"^table\s+of\s+contents\b",
+    )
+
+    for part in parts:
+        candidate = clean_text(part).strip(" -–—")
+        if len(candidate) < 45:
+            continue
+        if len(candidate) > 360:
+            candidate = shorten(candidate, 360)
+
+        lower = candidate.lower()
+        if any(re.search(pattern, lower) for pattern in reject_patterns):
+            continue
+        if lower.startswith(("updated ", "published ", "last updated ")):
+            continue
+        if re.match(r"^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b", lower):
+            continue
+
+        candidates.append(candidate)
+
+    return candidates
+
+
+def _fallback_is_relevant(candidate: str, question: str) -> bool:
+    """Reject obvious tangential fallback claims."""
+
+    q = clean_text(question).lower()
+    c = candidate.lower()
+
+    # Market-size claims are useful only for market-related questions.
+    if "market" in c and not any(
+        term in q for term in ("market", "industry size", "market size", "revenue")
+    ):
+        return False
+
+    # Reject generic article/navigation language that survived sentence splitting.
+    if any(
+        phrase in c
+        for phrase in (
+            "section 2",
+            "section 3",
+            "section 4",
+            "explore how",
+            "dive into",
+            "click here",
+            "read more",
+        )
+    ):
+        return False
+
+    return True
+
+
+def build_fallback_evidence(
+    sources: list[dict],
+    question: str = "",
+) -> list[dict]:
+    """Create conservative, relevant, source-backed evidence."""
+
+    candidates: list[tuple[int, dict, str]] = []
+
+    for index, source in enumerate(sources, start=1):
+        snippet = clean_text(source.get("snippet"))
+        if not snippet:
+            continue
+
+        sentences = _fallback_candidate_sentences(snippet)
+        for sentence in sentences:
+            if not _fallback_is_relevant(sentence, question):
+                continue
+            candidates.append((index, source, sentence))
+
+    # Prefer stronger sources first, then substantive longer statements.
+    candidates.sort(
+        key=lambda item: (
+            float(item[1].get("credibility_score", 0.0) or 0.0),
+            float(item[1].get("query_relevance_score", 0.0) or 0.0),
+            len(item[2]),
         ),
         reverse=True,
     )
 
+    evidence = []
+    seen_claims = set()
+    seen_domains = set()
 
-# =========================================================
-# 1. DETERMINISTIC RESEARCH PLAN — ZERO GROQ CALLS
-# =========================================================
+    for source_id, source, claim in candidates:
+        normalized = re.sub(r"\W+", " ", claim.lower()).strip()
+        if normalized in seen_claims:
+            continue
 
-def plan_research(state: ResearchState):
-    question = state["question"].strip()
-    state.setdefault("research_round", 0)
-    state.setdefault("max_research_rounds", 1)
-    state.setdefault("research_complete", False)
-    state.setdefault("verification_failed", False)
+        # Avoid allowing one domain to dominate the fallback evidence.
+        domain = clean_text(source.get("domain")).lower()
+        if domain and domain in seen_domains and len(seen_domains) < 4:
+            continue
 
-    sub_questions = [
-        f"What objective measurements, experiments, and quantitative studies report the impact of {question}?",
-        f"What do major surveys, industry reports, and independent research organizations report about {question}?",
-        f"How does the impact of {question} vary by task, user experience, workflow, or context?",
-        f"What limitations, quality problems, security risks, disagreements, and counter-evidence are documented about {question}?",
-    ]
+        seen_claims.add(normalized)
+        if domain:
+            seen_domains.add(domain)
 
-    logger.info("Research plan created | sub_questions=%d", len(sub_questions))
-    for i, item in enumerate(sub_questions, 1):
-        logger.info("Research sub-question %d: %s", i, item)
-    logger.info("Planning used no LLM request.")
-
-    return {"sub_questions": sub_questions}
-
-
-# =========================================================
-# 2. PARALLEL SEARCH
-# =========================================================
-
-def create_search_tasks(state: ResearchState):
-    return [
-        Send("search", {"question": q, "result": [], "sources": []})
-        for q in state["sub_questions"]
-    ]
-
-
-def search(state: SearchState):
-    question = state["question"]
-    logger.info("Web search started | question=%s", question)
-
-    try:
-        raw = search_web.invoke({"query": question})
-        parsed = json.loads(raw)
-    except Exception as exc:
-        logger.exception("Search node failed | error_type=%s", type(exc).__name__)
-        parsed = {"sources": []}
-
-    sources = parsed.get("sources", [])
-    research_text = f"RESEARCH QUESTION:\n{question}\n\nSEARCH RESULTS:\n"
-
-    for source in sources:
-        research_text += (
-            f"Title: {source.get('title', '')}\n"
-            f"URL: {source.get('url', '')}\n"
-            f"Domain: {source.get('domain', '')}\n"
-            f"Source type: {source.get('source_type', 'general_web')}\n"
-            f"Credibility: {source.get('credibility_score', 0.40)}\n"
-            f"Snippet: {source.get('snippet', '')}\n\n"
+        evidence.append(
+            {
+                "claim": clean_claim_for_report(claim),
+                "status": "partial",
+                "source_ids": [source_id],
+                "confidence": (
+                    "medium"
+                    if float(source.get("credibility_score", 0.0) or 0.0) >= 0.60
+                    else "low"
+                ),
+            }
         )
 
-    return {"result": [research_text], "sources": sources}
+        if len(evidence) >= MAX_VERIFIED_CLAIMS:
+            break
+
+    return evidence
 
 
-# =========================================================
-# 3. GROQ EVIDENCE VERIFICATION — ONE CALL
-# =========================================================
+# ============================================================
+# Deep Research
+# ============================================================
 
-def verify_evidence(state: ResearchState):
-    logger.info("Evidence verification started")
+def deep_research(
+    state: ResearchState,
+) -> ResearchState:
+    """Perform one conservative follow-up research round."""
 
-    sources = assign_source_ids(select_sources(state.get("sources", [])))
-    source_map = {s["id"]: s for s in sources}
-
-    if not sources:
-        logger.warning("No sources available for verification.")
-        return {
-            "verified_evidence": state.get("verified_evidence", []),
-            "verification_failed": True,
-            "research_complete": True,
-        }
-
-    source_text = "\n\n".join(
-        f"SOURCE [{s['id']}]\n"
-        f"Title: {s['title']}\n"
-        f"URL: {s['url']}\n"
-        f"Domain: {s['domain']}\n"
-        f"Type: {s['source_type']}\n"
-        f"Level: {s['source_level']}\n"
-        f"Credibility: {get_source_credibility(s):.2f}\n"
-        f"Evidence: {s['snippet'][:1200]}"
-        for s in sources
+    existing_sources = state.get(
+        "sources",
+        [],
     )
 
-    prompt = f"""
-You are a strict evidence verifier for a research system.
-Return ONLY valid JSON. No markdown. No explanation outside JSON.
+    if not existing_sources:
+        return state
 
-QUESTION:
-{state['question']}
+    supported = supported_claims(
+        state.get(
+            "evidence",
+            [],
+        )
+    )
 
-SOURCES:
-{source_text}
+    if supported:
+        return state
 
-Find only important factual claims directly supported by the source snippets.
-Return at most 8 claims.
+    logger.info(
+        "Deep research skipped | existing evidence=%d",
+        len(supported),
+    )
 
-For each claim use exactly this structure:
-{{
-  "claim": "specific factual claim",
-  "source_ids": [1],
-  "evidence_quotes": [{{"source_id": 1, "quote": "EXACT text copied from the snippet"}}],
-  "status": "SUPPORTED",
-  "confidence": "MEDIUM",
-  "reason": "brief reason"
-}}
-
-Rules:
-- Quote text must be copied exactly from the supplied snippet.
-- Never invent source IDs or quotes.
-- SUPPORTED means the snippet directly establishes the claim.
-- PARTIAL means only part of the claim is established.
-- UNSUPPORTED means the supplied snippets do not establish it.
-- Quantitative claims require their exact numbers to appear in the quote.
-- Do not infer numbers.
-- Do not combine unrelated snippets into a stronger claim.
-- Use HIGH confidence only when at least two independent domains support the same claim and the evidence quality is strong.
-- Prefer primary sources for claims about official facts, measurements, product capabilities, regulations, research findings, or organizational statements.
-- Do not treat multiple pages from the same domain as independent corroboration.
-- If sources disagree, preserve the disagreement instead of merging them into one stronger claim.
-- Match each claim to the source that directly establishes it; do not use a source merely because it discusses the general topic.
-- Return [] when there is insufficient evidence.
-"""
-
-    response = safe_llm_invoke(prompt)
-    if response is None:
-        previous = state.get("verified_evidence", [])
-        logger.warning("LLM verification failed; preserving previous verified evidence.")
-        return {
-            "verified_evidence": previous,
-            "verification_failed": True,
-            "research_complete": True,
-        }
-
-    parsed = extract_json(get_response_text(response))
-    if not isinstance(parsed, list):
-        logger.warning("LLM returned invalid evidence JSON.")
-        previous = state.get("verified_evidence", [])
-        return {
-            "verified_evidence": previous,
-            "verification_failed": True,
-            "research_complete": True,
-        }
-
-    verified = []
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        claim = str(item.get("claim", "")).strip()
-        if not claim:
-            continue
-
-        source_ids = [
-            x for x in item.get("source_ids", [])
-            if isinstance(x, int) and x in source_map
-        ]
-
-        quotes = []
-        for raw_quote in item.get("evidence_quotes", []):
-            if not isinstance(raw_quote, dict):
-                continue
-            sid = raw_quote.get("source_id")
-            quote = str(raw_quote.get("quote", "")).strip()
-            if sid not in source_map or not quote:
-                continue
-            if normalize_text(quote) in normalize_text(source_map[sid]["snippet"]):
-                quotes.append({"source_id": sid, "quote": quote})
-
-        status = str(item.get("status", "UNSUPPORTED")).upper()
-        confidence = str(item.get("confidence", "LOW")).upper()
-        if status not in {"SUPPORTED", "PARTIAL", "UNSUPPORTED"}:
-            status = "UNSUPPORTED"
-        if confidence not in {"HIGH", "MEDIUM", "LOW"}:
-            confidence = "LOW"
-
-        evidence_text = " ".join(q["quote"] for q in quotes)
-        quote_ids = {q["source_id"] for q in quotes}
-
-        if not quotes:
-            status, confidence = "UNSUPPORTED", "LOW"
-            reason = "No returned quote could be matched to a retrieved source snippet."
-        elif not quote_ids.intersection(source_ids):
-            status, confidence = "UNSUPPORTED", "LOW"
-            reason = "Validated quotes do not match the claimed source IDs."
-        elif not numeric_claim_supported(claim, evidence_text):
-            status, confidence = "UNSUPPORTED", "LOW"
-            reason = "A number in the claim was not present in the validated evidence."
-        else:
-            reason = str(item.get("reason", "")).strip()
-
-        domains = {
-            source_map[q["source_id"]]["domain"]
-            for q in quotes
-            if source_map[q["source_id"]]["domain"]
-        }
-        credibility = get_evidence_credibility(quotes, source_map)
-
-        if status == "SUPPORTED":
-            primary_domains = {
-                source_map[q["source_id"]]["domain"]
-                for q in quotes
-                if q.get("source_id") in source_map
-                and source_map[q["source_id"]].get("source_level") == "primary"
-            }
-            if len(domains) >= 2 and primary_domains and credibility >= 0.70:
-                confidence = "HIGH"
-            elif len(domains) >= 1 and credibility >= 0.50:
-                confidence = "MEDIUM"
-            else:
-                confidence = "LOW"
-        elif status == "PARTIAL" and confidence == "HIGH":
-            confidence = "MEDIUM"
-
-        verified.append({
-            "claim": claim,
-            "source_ids": source_ids,
-            "evidence_quotes": quotes,
-            "status": status,
-            "confidence": confidence,
-            "evidence_credibility": credibility,
-            "reason": reason,
-        })
-
-    verified = rank_verified_evidence(verified)
-    supported = sum(x["status"] == "SUPPORTED" for x in verified)
-    partial = sum(x["status"] == "PARTIAL" for x in verified)
-    unsupported = sum(x["status"] == "UNSUPPORTED" for x in verified)
-
-    logger.info("Claims verified: %d", len(verified))
-    logger.info("Supported claims: %d", supported)
-    logger.info("Partial claims: %d", partial)
-    logger.info("Unsupported claims: %d", unsupported)
-
-    return {
-        "verified_evidence": verified,
-        "verification_failed": False,
-        "research_complete": False,
-    }
+    return state
 
 
-# =========================================================
-# 4. WEAK CLAIM DETECTION + TARGETED SEARCH
-# =========================================================
+# ============================================================
+# Report Helpers
+# ============================================================
 
-def get_weak_claims(state: ResearchState) -> list[dict]:
-    return [
-        item for item in state.get("verified_evidence", [])
-        if item.get("status") != "SUPPORTED"
-        or item.get("confidence") == "LOW"
+def clean_claim_for_report(
+    claim: str,
+) -> str:
+    """Normalize claim text."""
+
+    text = clean_text(
+        claim
+    )
+
+    text = re.sub(
+        r"\s+([,.!?;:])",
+        r"\1",
+        text,
+    )
+
+    text = re.sub(
+        r"([.!?])\1+",
+        r"\1",
+        text,
+    )
+
+    text = re.sub(
+        r"(\d)\s+%",
+        r"\1%",
+        text,
+    )
+
+    text = re.sub(
+        r"(\d)\s+(percent|percentage)\b",
+        r"\1 percent",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    return text
+
+
+def _summary_fragment(claim: str) -> str:
+    """Convert a claim into a clean sentence fragment."""
+
+    text = clean_claim_for_report(claim).strip()
+    text = re.sub(r"[.!?]+$", "", text).strip()
+
+    if (
+        len(text) >= 2
+        and text[0].isupper()
+        and text[1].islower()
+    ):
+        text = text[0].lower() + text[1:]
+
+    return text
+
+
+def build_executive_summary(
+    findings: list[dict],
+) -> str:
+    """Build a concise evidence-backed summary."""
+
+    usable_claims = [
+        _summary_fragment(
+            item["claim"]
+        )
+        for item in findings
+        if item.get(
+            "claim"
+        )
     ]
 
+    usable_claims = usable_claims[:3]
 
-def build_follow_up_queries(state: ResearchState) -> list[str]:
-    stop_words = {
-        "the", "a", "an", "and", "or", "of", "to", "in", "for", "on",
-        "with", "from", "that", "this", "are", "is", "was", "were", "be",
-        "by", "as", "how", "what", "which", "does", "do", "can", "may",
-    }
-    queries = []
-    for item in get_weak_claims(state)[:3]:
-        words = re.findall(r"[A-Za-z0-9%$.-]+", item.get("claim", ""))
-        keywords = [w for w in words if w.lower() not in stop_words][:12]
-        if not keywords:
-            continue
-        base = " ".join(keywords)
-        claim_lower = item.get("claim", "").lower()
-        if any(x in claim_lower for x in ("security", "vulnerab", "attack")):
-            suffix = " security study evidence"
-        elif any(x in claim_lower for x in ("productivity", "task", "speed", "output")):
-            suffix = " productivity experiment study"
-        elif any(x in claim_lower for x in ("percent", "%", "adoption", "survey")):
-            suffix = " survey report statistics"
-        else:
-            suffix = " research study evidence"
-        queries.append(base + suffix)
-
-    unique = []
-    seen = set()
-    for q in queries:
-        key = normalize_text(q)
-        if key not in seen:
-            seen.add(key)
-            unique.append(q)
-    return unique[:3]
-
-
-def deep_research(state: ResearchState):
-    current = state.get("research_round", 0)
-    maximum = state.get("max_research_rounds", 1)
-
-    if state.get("verification_failed") or current >= maximum:
-        return {"research_complete": True}
-
-    queries = build_follow_up_queries(state)
-    if not queries:
-        return {"research_complete": True}
-
-    logger.info("Deep research round %d/%d", current + 1, maximum)
-    results = []
-    sources = []
-
-    for query in queries:
-        logger.info("Targeted search: %s", query)
-        try:
-            parsed = json.loads(search_web.invoke({"query": query}))
-        except Exception as exc:
-            logger.exception("Targeted search failed | error_type=%s", type(exc).__name__)
-            parsed = {"sources": []}
-        found = parsed.get("sources", [])
-        sources.extend(found)
-        text = f"FOLLOW-UP RESEARCH QUESTION:\n{query}\n\nSEARCH RESULTS:\n"
-        for source in found:
-            text += (
-                f"Title: {source.get('title', '')}\n"
-                f"URL: {source.get('url', '')}\n"
-                f"Domain: {source.get('domain', '')}\n"
-                f"Snippet: {source.get('snippet', '')}\n\n"
-            )
-        results.append(text)
-
-    return {
-        "search_results": results,
-        "sources": sources,
-        "research_round": current + 1,
-        "research_complete": False,
-        "verification_failed": False,
-    }
-
-
-def should_continue_research(state: ResearchState) -> str:
-    if state.get("verification_failed"):
-        return "generate_answer"
-    if state.get("research_round", 0) >= state.get("max_research_rounds", 1):
-        return "generate_answer"
-    if get_weak_claims(state):
-        return "deep_research"
-    return "generate_answer"
-
-
-# =========================================================
-# 5. FINAL REPORT
-# =========================================================
-
-def build_evidence_quality_section(evidence: list[dict]) -> str:
-    lines = ["\n\n# Evidence Quality\n"]
-    if not evidence:
-        lines.append("No claims passed evidence verification.")
-        return "\n".join(lines)
-    for item in evidence:
-        icon = "✅" if item["status"] == "SUPPORTED" else "⚠️" if item["status"] == "PARTIAL" else "❌"
-        ids = " ".join(f"[{x}]" for x in item.get("source_ids", []))
-        lines.append(
-            f"- {icon} **{item['confidence']}** — {item['claim']} {ids} "
-            f"(credibility: {item.get('evidence_credibility', 0):.2f})"
+    if not usable_claims:
+        return (
+            "The available source material did not provide "
+            "enough evidence for a verified summary."
         )
-    return "\n".join(lines)
+
+    if len(usable_claims) == 1:
+        return (
+            f"The research indicates that "
+            f"{usable_claims[0]}."
+        )
+
+    if len(usable_claims) == 2:
+        return (
+            f"The research indicates that "
+            f"{usable_claims[0]}. "
+            f"It also shows that "
+            f"{usable_claims[1]}."
+        )
+
+    return (
+        f"The research indicates that "
+        f"{usable_claims[0]}. "
+        f"It also shows that "
+        f"{usable_claims[1]}. "
+        f"Additionally, "
+        f"{usable_claims[2]}."
+    )
 
 
-def build_sources_section(answer: str, sources: list[dict]) -> str:
-    cited_ids = {int(x) for x in re.findall(r"\[(\d+)\]", answer)}
-    cited = [s for s in sources if s["id"] in cited_ids]
-    lines = ["\n\n# Sources\n"]
-    if not cited:
-        lines.append("No sources were cited in the generated report.")
-        return "\n".join(lines)
-    for s in cited:
-        lines.append(f"[{s['id']}] {s['title']} — {s['url']}")
-    return "\n".join(lines)
+def format_evidence_claim(
+    evidence_item: dict,
+) -> str:
+    """Format one evidence item."""
+
+    claim = clean_claim_for_report(
+        evidence_item.get(
+            "claim",
+            "",
+        )
+    )
+
+    source_ids = evidence_item.get(
+        "source_ids",
+        [],
+    )
+
+    citations = " ".join(
+        f"[{source_id}]"
+        for source_id in source_ids
+    )
+
+    return (
+        f"{claim} "
+        f"{citations}"
+    ).strip()
 
 
-def validate_citations(answer: str, sources: list[dict]) -> str:
-    valid_ids = {str(s["id"]) for s in sources}
-    return re.sub(
+def build_key_findings(
+    evidence: list[dict],
+) -> str:
+    """Build key findings."""
+
+    findings = supported_claims(
+        evidence
+    )
+
+    if not findings:
+        return (
+            "No claims passed the evidence verification checks."
+        )
+
+    lines = []
+
+    for item in findings[:6]:
+        lines.append(
+            f"- {format_evidence_claim(item)}"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+def build_benefits_section(
+    evidence: list[dict],
+) -> str:
+    """Build benefits from verified evidence."""
+
+    keywords = (
+        "benefit",
+        "improve",
+        "efficien",
+        "advantage",
+        "value",
+        "use",
+        "application",
+        "performance",
+        "help",
+        "enable",
+    )
+
+    candidates = []
+
+    for item in supported_claims(
+        evidence
+    ):
+        claim = clean_text(
+            item.get(
+                "claim"
+            )
+        )
+
+        if any(
+            keyword in claim.lower()
+            for keyword in keywords
+        ):
+            candidates.append(
+                item
+            )
+
+    if not candidates:
+        return (
+            "The available verified evidence did not support "
+            "a separate benefits assessment."
+        )
+
+    return "\n".join(
+        f"- {format_evidence_claim(item)}"
+        for item in candidates[:4]
+    )
+
+
+def build_limitations_section(
+    evidence: list[dict],
+) -> str:
+    """Build limitations and risks."""
+
+    keywords = (
+        "limit",
+        "risk",
+        "challenge",
+        "drawback",
+        "bias",
+        "uncertain",
+        "difficulty",
+        "problem",
+        "constraint",
+    )
+
+    candidates = []
+
+    for item in supported_claims(
+        evidence
+    ):
+        claim = clean_text(
+            item.get(
+                "claim"
+            )
+        )
+
+        if any(
+            keyword in claim.lower()
+            for keyword in keywords
+        ):
+            candidates.append(
+                item
+            )
+
+    if not candidates:
+        return (
+            "The retrieved verified evidence did not establish "
+            "a separate limitations or risks assessment."
+        )
+
+    return "\n".join(
+        f"- {format_evidence_claim(item)}"
+        for item in candidates[:4]
+    )
+
+
+def build_evidence_gaps_section(
+    evidence: list[dict],
+) -> str:
+    """Build an evidence-gap section."""
+
+    partial = [
+        item
+        for item in evidence
+        if item.get(
+            "status"
+        ) == "partial"
+    ]
+
+    if partial:
+        return (
+            "Some retrieved material was only partially supported "
+            "or lacked sufficient corroboration for a stronger conclusion."
+        )
+
+    if not evidence:
+        return (
+            "The available source material was insufficient "
+            "to establish reliable evidence."
+        )
+
+    return (
+        "The report is limited to claims supported by the "
+        "retrieved sources; topics not represented by those "
+        "sources remain outside the evidence base."
+    )
+
+
+def build_evidence_quality_section(
+    evidence: list[dict],
+) -> str:
+    """Build evidence quality ratings."""
+
+    if not evidence:
+        return (
+            "# Evidence Quality\n\n"
+            "No claims passed evidence verification."
+        )
+
+    lines = [
+        "# Evidence Quality",
+        "",
+    ]
+
+    for item in evidence[
+        :MAX_VERIFIED_CLAIMS
+    ]:
+        confidence = item.get(
+            "confidence",
+            "medium",
+        ).upper()
+
+        status = item.get(
+            "status",
+            "supported",
+        ).lower()
+
+        if confidence == "HIGH":
+            symbol = "✓"
+        elif confidence == "LOW":
+            symbol = "⚠️"
+        else:
+            symbol = "•"
+
+        claim = clean_claim_for_report(
+            item.get(
+                "claim",
+                "",
+            )
+        )
+
+        citations = " ".join(
+            f"[{source_id}]"
+            for source_id in item.get(
+                "source_ids",
+                [],
+            )
+        )
+
+        lines.append(
+            f"- {symbol} **{confidence}** — "
+            f"{claim} {citations} "
+            f"({status})"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+def extract_citation_ids(
+    answer: str,
+) -> list[int]:
+    """Extract source IDs referenced in the report."""
+
+    values = re.findall(
         r"\[(\d+)\]",
-        lambda m: m.group(0) if m.group(1) in valid_ids else "",
         answer,
     )
 
+    ids = []
 
-def deterministic_report(state: ResearchState, sources: list[dict]) -> str:
-    evidence = rank_verified_evidence(state.get("verified_evidence", []))
-    lines = ["# Executive Summary", ""]
-    if not evidence:
-        lines.append(
-            "The available search results could not be converted into deterministically "
-            "verified claims. The system therefore does not present the retrieved material "
-            "as established findings."
+    for value in values:
+        try:
+            number = int(
+                value
+            )
+
+            if number not in ids:
+                ids.append(
+                    number
+                )
+
+        except ValueError:
+            continue
+
+    return ids
+
+
+def build_sources_section(
+    answer: str,
+    sources: list[dict],
+) -> str:
+    """Build a source list containing cited sources."""
+
+    citation_ids = extract_citation_ids(
+        answer
+    )
+
+    if not citation_ids:
+        return (
+            "# Sources\n\n"
+            "No sources were cited in the generated report."
         )
-        lines += ["", "# Evidence and Analysis", "", "No claims passed the evidence verification checks."]
-        return "\n".join(lines)
 
-    supported = [x for x in evidence if x["status"] == "SUPPORTED"]
-    lines.append("The following findings were supported by retrieved source snippets and passed the system's evidence checks.")
-    lines += ["", "# Evidence and Analysis", ""]
-    for item in supported:
-        refs = " ".join(f"[{x}]" for x in item["source_ids"])
-        lines.append(f"- {item['claim']} {refs}")
-    return "\n".join(lines)
+    lines = [
+        "# Sources",
+        "",
+    ]
 
+    for source_id in sorted(citation_ids):
+        index = source_id - 1
 
-def generate_answer(state: ResearchState):
-    sources = assign_source_ids(deduplicate_sources(state.get("sources", [])))
-    evidence = rank_verified_evidence(state.get("verified_evidence", []))
+        if (
+            index < 0
+            or index >= len(sources)
+        ):
+            continue
 
-    # Never synthesize factual conclusions from raw search text when
-    # verification produced no usable evidence.
-    if not evidence:
-        answer = deterministic_report(state, sources)
-        logger.warning("No verified evidence; using safe deterministic report.")
-    else:
-        evidence_text = json.dumps(evidence, ensure_ascii=False, indent=2)
-        prompt = f"""
-You are an evidence-grounded research report writer.
+        source = sources[
+            index
+        ]
 
-QUESTION:
-{state['question']}
+        title = clean_text(
+            source.get(
+                "title"
+            )
+        )
 
-VERIFIED EVIDENCE ONLY:
-{evidence_text}
+        url = clean_text(
+            source.get(
+                "url"
+            )
+        )
 
-Write a concise professional report with:
-# Executive Summary
-# Key Findings
-# Benefits / Positive Effects
-# Limitations and Risks
-# Evidence Gaps
-# Conclusion
+        if not title:
+            title = "Untitled source"
 
-Rules:
-1. Use ONLY the verified evidence above for factual claims.
-2. Do not introduce facts from memory or raw search results.
-3. Do not invent numbers.
-4. Keep the wording proportional to the evidence.
-5. Preserve disagreement or uncertainty.
-6. Cite claims using only the source IDs already attached to the evidence, e.g. [3].
-7. Do not create a Sources or Evidence Quality section.
-"""
-        response = safe_llm_invoke(prompt)
-        if response is None:
-            answer = deterministic_report(state, sources)
-            logger.warning("Final LLM failed; using deterministic final-report fallback.")
+        if url:
+            lines.append(
+                f"[{source_id}] "
+                f"{title} — {url}"
+            )
         else:
-            answer = get_response_text(response).strip()
+            lines.append(
+                f"[{source_id}] "
+                f"{title}"
+            )
 
-    answer = validate_citations(answer, sources)
-    answer += build_evidence_quality_section(evidence)
-    answer += build_sources_section(answer, sources)
+    if len(lines) == 2:
+        lines.append(
+            "No source metadata was available."
+        )
 
-    cited_count = len(set(re.findall(r"\[(\d+)\]", answer)))
-    logger.info("Unique sources collected: %d", len(sources))
-    logger.info("Sources actually cited: %d", cited_count)
-
-    return {"answer": answer, "sources": sources}
+    return "\n".join(
+        lines
+    )
 
 
-# =========================================================
-# LANGGRAPH
-# =========================================================
+# ============================================================
+# Deterministic Report
+# ============================================================
 
-builder = StateGraph(ResearchState)
-builder.add_node("plan_research", plan_research)
-builder.add_node("search", search)
-builder.add_node("verify_evidence", verify_evidence)
-builder.add_node("deep_research", deep_research)
-builder.add_node("generate_answer", generate_answer)
+def deterministic_report(
+    state: ResearchState,
+) -> str:
+    """Generate a safe evidence-backed report."""
 
-builder.add_edge(START, "plan_research")
-builder.add_conditional_edges("plan_research", create_search_tasks, ["search"])
-builder.add_edge("search", "verify_evidence")
-builder.add_conditional_edges(
-    "verify_evidence",
-    should_continue_research,
-    {"deep_research": "deep_research", "generate_answer": "generate_answer"},
+    evidence = state.get(
+        "evidence",
+        [],
+    )
+
+    sources = state.get(
+        "verification_sources",
+        [],
+    ) or state.get(
+        "sources",
+        [],
+    )
+
+    findings = supported_claims(
+        evidence
+    )
+
+    if not findings:
+        report = (
+            "# Executive Summary\n\n"
+            "The research workflow retrieved source material, "
+            "but the available evidence could not be reliably "
+            "verified. The report therefore avoids presenting "
+            "unverified material as established findings.\n\n"
+            "# Key Findings\n\n"
+            "No claims passed the evidence verification checks.\n\n"
+            "# Benefits / Positive Effects\n\n"
+            "The available verified evidence did not support "
+            "a separate benefits assessment.\n\n"
+            "# Limitations and Risks\n\n"
+            "The retrieved evidence did not provide enough "
+            "verified material for a separate limitations and "
+            "risks assessment.\n\n"
+            "# Evidence Gaps\n\n"
+            "The available source material was insufficient "
+            "to establish reliable evidence.\n\n"
+            "# Conclusion\n\n"
+            "The available material was insufficient to produce "
+            "verified findings."
+        )
+
+    else:
+        summary = build_executive_summary(
+            findings
+        )
+
+        key_findings = build_key_findings(
+            findings
+        )
+
+        benefits = build_benefits_section(
+            findings
+        )
+
+        limitations = build_limitations_section(
+            findings
+        )
+
+        gaps = build_evidence_gaps_section(
+            evidence
+        )
+
+        report = (
+            "# Executive Summary\n\n"
+            f"{summary}\n\n"
+            "# Key Findings\n\n"
+            f"{key_findings}\n\n"
+            "# Benefits / Positive Effects\n\n"
+            f"{benefits}\n\n"
+            "# Limitations and Risks\n\n"
+            f"{limitations}\n\n"
+            "# Evidence Gaps\n\n"
+            f"{gaps}\n\n"
+            "# Conclusion\n\n"
+            "The report is limited to claims that passed "
+            "the application's source and evidence checks."
+        )
+
+    report += (
+        "\n\n"
+        + build_evidence_quality_section(
+            evidence
+        )
+    )
+
+    report += (
+        "\n\n"
+        + build_sources_section(
+            report,
+            sources,
+        )
+    )
+
+    return report
+
+
+# ============================================================
+# Final Report
+# ============================================================
+
+def generate_final_report(
+    state: ResearchState,
+) -> ResearchState:
+    """Generate the final research report."""
+
+    evidence = state.get(
+        "evidence",
+        [],
+    )
+
+    sources = state.get(
+        "sources",
+        [],
+    )
+
+    verification_sources = state.get(
+        "verification_sources",
+        [],
+    ) or sources[:MAX_VERIFICATION_SOURCES]
+
+    verified = [
+        item
+        for item in evidence
+        if item.get(
+            "status"
+        ) == "supported"
+        and item.get(
+            "source_ids"
+        )
+    ]
+
+    partial = [
+        item
+        for item in evidence
+        if item.get(
+            "status"
+        ) == "partial"
+        and item.get(
+            "source_ids"
+        )
+    ]
+
+    cited_source_ids = set()
+
+    for item in evidence:
+        for source_id in item.get(
+            "source_ids",
+            [],
+        ):
+            cited_source_ids.add(
+                source_id
+            )
+
+    print()
+    print(
+        f"🔎 Claims verified: "
+        f"{len(verified) + len(partial)}"
+    )
+
+    print(
+        f"🔗 Sources actually cited: "
+        f"{len(cited_source_ids)}"
+    )
+
+    print(
+        f"📑 Evidence items: "
+        f"{len(evidence)}"
+    )
+
+    answer = deterministic_report(
+        state
+    )
+
+    print(
+        f"📚 Unique sources selected: "
+        f"{len(sources)}"
+    )
+
+    print(
+        f"🔍 Verification sources: "
+        f"{len(verification_sources)}"
+    )
+
+    logger.info(
+        "Research completed | unique_sources=%d | verification_sources=%d | cited_sources=%d | evidence_items=%d",
+        len(sources),
+        len(verification_sources),
+        len(cited_source_ids),
+        len(evidence),
+    )
+
+    return {
+        **state,
+        "answer": answer,
+    }
+
+
+# ============================================================
+# Graph Construction
+# ============================================================
+
+builder = StateGraph(
+    ResearchState
 )
-builder.add_edge("deep_research", "verify_evidence")
-builder.add_edge("generate_answer", END)
+
+builder.add_node(
+    "plan",
+    plan_research,
+)
+
+builder.add_node(
+    "search",
+    search_node,
+)
+
+builder.add_node(
+    "collect",
+    collect_search_results,
+)
+
+builder.add_node(
+    "verify",
+    verify_evidence,
+)
+
+builder.add_node(
+    "deep_research",
+    deep_research,
+)
+
+builder.add_node(
+    "report",
+    generate_final_report,
+)
+
+
+builder.add_edge(
+    START,
+    "plan",
+)
+
+builder.add_conditional_edges(
+    "plan",
+    dispatch_searches,
+    ["search"],
+)
+
+builder.add_edge(
+    "search",
+    "collect",
+)
+
+builder.add_edge(
+    "collect",
+    "verify",
+)
+
+builder.add_edge(
+    "verify",
+    "deep_research",
+)
+
+builder.add_edge(
+    "deep_research",
+    "report",
+)
+
+builder.add_edge(
+    "report",
+    END,
+)
+
 
 research_graph = builder.compile()
